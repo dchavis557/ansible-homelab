@@ -1,0 +1,146 @@
+---
+# Updates & reboots (Ubuntu + Fedora), one host at a time
+- name: Update and Upgrade Linux Systems (Ubuntu & Fedora)
+  hosts: all
+  become: true
+  gather_facts: yes
+  # serial: 1              # avoid rebooting everything at once
+  vars:
+    reboot_needed: false
+
+  tasks:
+    - name: Show target OS
+      ansible.builtin.debug:
+        msg: "Managing {{ inventory_hostname }} ({{ ansible_distribution }} {{ ansible_distribution_version }})"
+
+    # --------------------------
+    # Refresh package metadata
+    # --------------------------
+    - name: Update APT package list (Ubuntu/Debian)
+      ansible.builtin.apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      when: ansible_os_family == "Debian"
+
+    - name: Update DNF metadata (Fedora/RHEL-family)
+      ansible.builtin.dnf:
+        update_cache: yes
+      when: ansible_os_family == "RedHat"
+
+    # --------------------------
+    # Perform upgrades
+    # --------------------------
+    - name: Dist-upgrade on Ubuntu/Debian
+      ansible.builtin.apt:
+        upgrade: dist
+      when: ansible_os_family == "Debian"
+
+    - name: Update all packages on Fedora/RHEL-family
+      ansible.builtin.dnf:
+        name: "*"
+        state: latest
+      when: ansible_os_family == "RedHat"
+
+    # --------------------------
+    # Autoremove
+    # --------------------------
+    - name: Autoremove on Ubuntu/Debian
+      ansible.builtin.apt:
+        autoremove: yes
+      when: ansible_os_family == "Debian"
+
+    - name: Autoremove on Fedora/RHEL-family
+      ansible.builtin.dnf:
+        autoremove: yes
+      when: ansible_os_family == "RedHat"
+
+    # --------------------------
+    # Determine reboot necessity
+    # --------------------------
+    - name: Check if reboot is required (Ubuntu/Debian)
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_check_deb
+      when: ansible_os_family == "Debian"
+
+    - name: Ensure 'needs-restarting' plugin is present (Fedora)
+      ansible.builtin.package:
+        name: dnf-plugins-core
+        state: present
+      when: ansible_distribution == "Fedora"
+
+    - name: Check if reboot is required (Fedora via needs-restarting -r)
+      ansible.builtin.command: dnf -q needs-restarting -r
+      register: reboot_check_fedora
+      changed_when: false
+      failed_when: false
+      when: ansible_distribution == "Fedora"
+
+    - name: Set reboot_needed fact (normalize across distros)
+      ansible.builtin.set_fact:
+        reboot_needed: >-
+          {{
+            (ansible_os_family == "Debian" and reboot_check_deb.stat.exists | default(false))
+            or
+            (ansible_distribution == "Fedora" and reboot_check_fedora.rc | default(0) != 0)
+          }}
+
+    - name: Log reboot status
+      ansible.builtin.debug:
+        msg: >-
+          {{ "🚨 Reboot is required on this host!" if reboot_needed
+             else "✅ No reboot needed on this host." }}
+
+    # --------------------------
+    # Reboot if needed
+    # --------------------------
+    - name: Reboot the server if needed
+      ansible.builtin.reboot:
+        msg: "Rebooting after updates."
+        pre_reboot_delay: 10
+        reboot_timeout: 600
+        post_reboot_delay: 30
+      when: reboot_needed
+
+    # Optional: re-gather facts post-reboot for downstream plays/tools
+    - name: Refresh facts after reboot
+      ansible.builtin.setup:
+      when: reboot_needed
+
+# Verification pass (only pings hosts that actually rebooted)
+- name: Verify rebooted systems are back online
+  hosts: all
+  become: false
+  gather_facts: false
+
+  tasks:
+    - name: Determine if this host rebooted (from previous play)
+      ansible.builtin.set_fact:
+        _did_reboot: "{{ hostvars[inventory_hostname].reboot_needed | default(false) }}"
+
+    - name: Skip verification if this host did not reboot
+      ansible.builtin.debug:
+        msg: "✅ {{ inventory_hostname }} did not need a reboot. Skipping verification."
+      when: not _did_reboot
+
+    - name: Wait 2 minutes for services to settle (only rebooted hosts)
+      ansible.builtin.pause:
+        minutes: 2
+      when: _did_reboot
+
+    - name: Ping host after reboot
+      ansible.builtin.ping:
+      when: _did_reboot
+
+    # Nice run_once summary for Semaphore logs
+    - name: Summary of hosts that rebooted
+      ansible.builtin.debug:
+        msg: >-
+          Rebooted hosts: {{
+             play_hosts
+            | zip(play_hosts | map('extract', hostvars, 'reboot_needed') | list)
+            | selectattr('1', 'equalto', true)
+            | map('first')
+            | list
+          }}
+      run_once: true
