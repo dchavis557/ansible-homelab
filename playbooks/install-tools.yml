@@ -1,0 +1,33 @@
+---
+- name: Install base tools on lab targets
+  hosts: lab
+  become: true
+
+  vars:
+    packages:
+      - curl
+      - neofetch
+      - btop
+      - mc
+
+  tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install base packages
+      ansible.builtin.apt:
+        name: "{{ packages }}"
+        state: present
+
+    - name: Confirm installations
+      ansible.builtin.command: "which {{ item }}"
+      loop: "{{ packages }}"
+      register: which_output
+      changed_when: false
+
+    - name: Print install confirmation
+      ansible.builtin.debug:
+        msg: "{{ item.item }} found at {{ item.stdout }}"
+      loop: "{{ which_output.results }}"
